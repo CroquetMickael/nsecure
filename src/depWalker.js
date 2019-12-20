@@ -12,15 +12,14 @@ const premove = require("premove");
 const semver = require("semver");
 const Lock = require("@slimio/lock");
 const Spinner = require("@slimio/async-cli-spinner");
-const isMinified = require("is-minified-code");
 const Registry = require("@slimio/npm-registry");
 const combineAsyncIterators = require("combine-async-iterators");
 const uniqueSlug = require("unique-slug");
 
 // Require Internal Dependencies
 const { getTarballComposition, mergeDependencies, getLicenseFromString, cleanRange, getRegistryURL } = require("./utils");
-const { searchRuntimeDependencies } = require("./ast");
 const Dependency = require("./dependency.class");
+const { initASTWorkers } = require("./workers");
 
 // CONSTANTS
 const JS_EXTENSIONS = new Set([".js", ".mjs"]);
@@ -135,7 +134,7 @@ async function* searchDeepDependencies(packageName, gitURL, options = {}) {
  * @returns {Promise<void>}
  */
 async function processPackageTarball(name, version, options) {
-    const { ref, tmpLocation } = options;
+    const { ref, tmpLocation, workers } = options;
 
     const dest = join(tmpLocation, `${name}@${version}`);
     const free = await tarballLocker.acquireOne();
@@ -192,13 +191,19 @@ async function processPackageTarball(name, version, options) {
 
         for (const file of jsFiles) {
             try {
-                const str = await readFile(join(dest, file), "utf-8");
-                if (!file.includes(".min") && isMinified(str)) {
+                const workerResponse = await workers.execute({
+                    dest, file, isProjectUsingESM
+                });
+                console.log(workerResponse);
+                if (workerResponse === null) {
+                    continue;
+                }
+                const { isMinified, deps, isSuspect } = workerResponse;
+
+                if (isMinified) {
                     ref.composition.minified.push(file);
                 }
 
-                const usingECMAModules = extname(file) === ".mjs" ? true : isProjectUsingESM;
-                const { dependencies: deps, isSuspect } = searchRuntimeDependencies(str, usingECMAModules);
                 dependencies.push(...deps);
                 if (isSuspect) {
                     suspectFiles.push(file);
@@ -366,6 +371,7 @@ async function depWalker(manifest, options = Object.create(null)) {
     const promisesToWait = [];
     const exclude = new Map();
 
+    const workers = initASTWorkers();
     for await (const currentDep of getRootDependencies(manifest, { maxDepth: options.maxDepth, exclude })) {
         const { name, version } = currentDep;
         const current = currentDep.flatten(name === manifest.name ? 0 : void 0);
@@ -374,7 +380,8 @@ async function depWalker(manifest, options = Object.create(null)) {
         promisesToWait.push(searchPackageAuthors(name, current.metadata));
         promisesToWait.push(processPackageTarball(name, version, {
             ref: current[version],
-            tmpLocation: randomTMP
+            tmpLocation: randomTMP,
+            workers
         }));
 
         if (flattenedDeps.has(name)) {
@@ -404,6 +411,9 @@ async function depWalker(manifest, options = Object.create(null)) {
 
         return null;
     }
+
+    // Cut all workers!
+    await workers.terminate();
 
     // Search for vulnerabilities in the local .json db
     try {
